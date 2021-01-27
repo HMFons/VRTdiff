@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import time
-
+import re
 import bleach
 import dataset
 from PIL import Image
@@ -17,6 +17,7 @@ import requests
 import tweepy
 from simplediff import html_diff
 from selenium import webdriver
+from webdriver_manager.chrome import ChromeDriverManager
 
 import feedparser
 
@@ -38,8 +39,6 @@ if 'LOG_FOLDER' in os.environ:
 else:
     LOG_FOLDER = ''
 
-PHANTOMJS_PATH = os.environ['PHANTOMJS_PATH']
-
 
 class BaseParser(object):
     def __init__(self, api):
@@ -50,6 +49,7 @@ class BaseParser(object):
         self.filename = str()
         self.db = dataset.connect('sqlite:///titles.db')
         self.api = api
+        self.articles_table = None
 
     def test_twitter(self):
         print(self.api.rate_limit_status())
@@ -197,7 +197,6 @@ class BaseParser(object):
             logging.info('Old or New empty')
             return False
         new_hash = hashlib.sha224(new.encode('utf8')).hexdigest()
-        logging.info(html_diff(old, new))
         html = """
         <!doctype html>
         <html lang="en">
@@ -212,12 +211,14 @@ class BaseParser(object):
           </body>
         </html>
         """.format(html_diff(old, new))
-        with open('tmp.html', 'w') as f:
+        with open('tmp.html', 'w', encoding='utf-8') as f:
             f.write(html)
 
-        driver = webdriver.PhantomJS(
-            executable_path=PHANTOMJS_PATH + 'phantomjs')
-        driver.get('tmp.html')
+        options = webdriver.ChromeOptions()
+        options.headless = True
+        driver = webdriver.Chrome(ChromeDriverManager().install(),options=options)
+
+        driver.get('file:///C:/Repos/NYTdiff/tmp.html')
         e = driver.find_element_by_xpath('//p')
         start_height = e.location['y']
         block_height = e.size['height']
@@ -251,127 +252,6 @@ class BaseParser(object):
     def __str__(self):
         return ('\n'.join(self.urls))
 
-
-class NYTParser(BaseParser):
-    def __init__(self, api, nyt_api_key):
-        BaseParser.__init__(self, api)
-        self.urls = ['https://api.nytimes.com/svc/topstories/v2/home.json']
-        self.payload = {'api-key': nyt_api_key}
-        self.articles_table = self.db['nyt_ids']
-        self.versions_table = self.db['nyt_versions']
-
-    def json_to_dict(self, article):
-        article_dict = dict()
-        if 'short_url' not in article:
-            return None
-        article_dict['article_id'] = article['short_url'].split('/')[-1]
-        article_dict['url'] = article['url']
-        article_dict['title'] = article['title']
-        article_dict['abstract'] = self.strip_html(article['abstract'])
-        article_dict['byline'] = article['byline']
-        article_dict['kicker'] = article['kicker']
-        od = collections.OrderedDict(sorted(article_dict.items()))
-        article_dict['hash'] = hashlib.sha224(
-            repr(od.items()).encode('utf-8')).hexdigest()
-        article_dict['date_time'] = datetime.now(LOCAL_TZ)
-        return article_dict
-
-    def store_data(self, data):
-        if self.articles_table.find_one(
-                article_id=data['article_id']) is None:  # New
-            article = {
-                'article_id': data['article_id'],
-                'add_dt': data['date_time'],
-                'status': 'home',
-                'tweet_id': None
-            }
-            self.articles_table.insert(article)
-            logging.info('New article tracked: %s', data['url'])
-            data['version'] = 1
-            self.versions_table.insert(data)
-        else:
-            # re insert
-            if self.articles_table.find_one(article_id=data['article_id'],
-                                            status='removed') is not None:
-                article = {
-                    'article_id': data['article_id'],
-                    'add_dt': data['date_time'],
-                }
-
-            count = self.versions_table.count(
-                self.versions_table.table.columns.article_id == data[
-                    'article_id'],
-                hash=data['hash'])
-            if count == 1:  # Existing
-                pass
-            else:  # Changed
-                result = self.db.query('SELECT * \
-                                       FROM nyt_versions\
-                                       WHERE article_id = "%s" \
-                                       ORDER BY version DESC \
-                                       LIMIT 1' % (data['article_id']))
-                for row in result:
-                    data['version'] = row['version']
-                    self.versions_table.insert(data)
-                    url = data['url']
-                    if row['url'] != data['url']:
-                        if self.show_diff(row['url'], data['url']):
-                            tweet_text = 'Change in URL'
-                            self.tweet(tweet_text, data['article_id'], url,
-                                       'article_id')
-                    if row['title'] != data['title']:
-                        if self.show_diff(row['title'], data['title']):
-                            tweet_text = 'Change in Title'
-                            self.tweet(tweet_text, data['article_id'], url,
-                                       'article_id')
-                    if row['abstract'] != data['abstract']:
-                        if self.show_diff(row['abstract'], data['abstract']):
-                            tweet_text = 'Change in Abstract'
-                            self.tweet(tweet_text, data['article_id'], url,
-                                       'article_id')
-                    if row['kicker'] != data['kicker']:
-                        if self.show_diff(row['kicker'], data['kicker']):
-                            tweet_text = 'Change in Kicker'
-                            self.tweet(tweet_text, data['article_id'], url,
-                                       'article_id')
-
-    def loop_data(self, data):
-        if 'results' not in data:
-            return False
-        for article in data['results']:
-            try:
-                article_dict = self.json_to_dict(article)
-                if article_dict is not None:
-                    self.store_data(article_dict)
-                    self.current_ids.add(article_dict['article_id'])
-            except BaseException as e:
-                logging.exception('Problem looping NYT: %s', article)
-                print ('Exception: {}'.format(str(e)))
-                print('***************')
-                print(article)
-                print('***************')
-                return False
-        return True
-
-    def parse_pages(self):
-        r = self.get_page(self.urls[0], None, self.payload)
-        if r is None or len(r.text) == 0:
-            logging.warning('Empty response NYT')
-            return
-        try:
-            data = json.loads(r.text, strict=False)
-        except BaseException as e:
-            logging.exception('Problem parsing page: %s', r.text)
-            print (e)
-            print (len(r.text))
-            print (type(r.text))
-            print (r.text)
-            print ('----')
-            return
-        loop = self.loop_data(data)
-        if loop:
-            self.remove_old('article_id')
-
 class RSSParser(BaseParser):
     def __init__(self, api, rss_url):
         BaseParser.__init__(self, api)
@@ -384,10 +264,7 @@ class RSSParser(BaseParser):
         article_dict['article_id'] = article.id.split(' ')[0]
         article_dict['url'] = article.link
         article_dict['title'] = article.title
-        article_dict['abstract'] = self.strip_html(article.description)
-        article_dict['author'] = article.author
-        # article_dict['illustration'] = article.media_content[0]['url']
-        # article_dict['illustartion_size'] = article.media_content[0]['filesize']
+        article_dict['abstract'] = self.strip_html(article.summary)
         od = collections.OrderedDict(sorted(article_dict.items()))
         article_dict['hash'] = hashlib.sha224(
             repr(od.items()).encode('utf-8')).hexdigest()
@@ -432,27 +309,23 @@ class RSSParser(BaseParser):
                     data['version'] = row['version'] +1
                     self.versions_table.insert(data)
                     url = data['url']
+                    if re.match(r'^Het Journaal (\d|Laat)$', row['title']) is not None or 'Terzake' == row['title'] or 'Het weer' == row['title'] or 'De afspraak' == row['title']:
+                        continue
+                    if row['url'] != data['url']:
+                        if self.show_diff(row['url'], data['url']):
+                            tweet_text = "URL aangepast"
+                            self.tweet(tweet_text, data['article_id'], url,
+                                       'article_id')
                     if row['title'] != data['title']:
                         if self.show_diff(row['title'], data['title']):
-                            tweet_text = "Modification du Titre"
+                            tweet_text = "Titel aangepast"
                             self.tweet(tweet_text, data['article_id'], url,
                                        'article_id')
                     if row['abstract'] != data['abstract']:
                         if self.show_diff(row['abstract'], data['abstract']):
-                            tweet_text = "Modification de la Description"
+                            tweet_text = "Samenvatting aangepast"
                             self.tweet(tweet_text, data['article_id'], url,
                                        'article_id')
-                    if row['author'] != data['author']:
-                        if self.show_diff(row['author'], data['author']):
-                            tweet_text = "Modification de l'auteur"
-                            self.tweet(tweet_text, data['article_id'], url,
-                                       'article_id')
-                    if row['url'] != data['url']:
-                        if self.show_diff(row['url'], data['url']):
-                            tweet_text = "Modification d'URL"
-                            self.tweet(tweet_text, data['article_id'], url,
-                                       'article_id')
-
     def loop_entries(self, entries):
         if len(entries) == 0:
             return False
@@ -491,10 +364,10 @@ def main():
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.info('Starting script')
 
-    consumer_key = os.environ['NYT_TWITTER_CONSUMER_KEY']
-    consumer_secret = os.environ['NYT_TWITTER_CONSUMER_SECRET']
-    access_token = os.environ['NYT_TWITTER_ACCESS_TOKEN']
-    access_token_secret = os.environ['NYT_TWITTER_ACCESS_TOKEN_SECRET']
+    consumer_key = os.environ['VRT_TWITTER_CONSUMER_KEY']
+    consumer_secret = os.environ['VRT_TWITTER_CONSUMER_SECRET']
+    access_token = os.environ['VRT_TWITTER_ACCESS_TOKEN']
+    access_token_secret = os.environ['VRT_TWITTER_ACCESS_TOKEN_SECRET']
     auth = tweepy.OAuthHandler(consumer_key, consumer_secret)
     auth.secure = True
     auth.set_access_token(access_token, access_token_secret)
@@ -503,8 +376,6 @@ def main():
 
     try:
         logging.debug('Starting RSS')
-        #nyt_api_key = os.environ['NYT_API_KEY']
-        #nyt = NYTParser(nyt_api, nyt_api_key)
         rss_url = os.environ['RSS_URL']
         rss = RSSParser(twitter_api, rss_url)
         rss.parse_rss()
