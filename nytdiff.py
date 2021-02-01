@@ -18,6 +18,7 @@ import tweepy
 from simplediff import html_diff
 from selenium import webdriver
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.utils import ChromeType
 
 import feedparser
 
@@ -216,7 +217,7 @@ class BaseParser(object):
 
         options = webdriver.ChromeOptions()
         options.headless = True
-        driver = webdriver.Chrome(ChromeDriverManager().install(),options=options)
+        driver = webdriver.Chrome('/usr/lib/chromium-browser/chromedriver', options=options)
 
         driver.get('file:///C:/Repos/NYTdiff/tmp.html')
         e = driver.find_element_by_xpath('//p')
@@ -309,7 +310,7 @@ class RSSParser(BaseParser):
                     data['version'] = row['version'] +1
                     self.versions_table.insert(data)
                     url = data['url']
-                    if re.match(r'^Het Journaal (\d|Laat)$', row['title']) is not None or 'Terzake' == row['title'] or 'Het weer' == row['title'] or 'De afspraak' == row['title']:
+                    if re.match(r'^Het Journaal (\d|Laat)$', row['title']) is not None or 'Terzake' == row['title'] or 'Het weer' == row['title'] or 'De afspraak' == row['title'] or 'Villa Politica' == row['title']:
                         continue
                     if row['url'] != data['url']:
                         if self.show_diff(row['url'], data['url']):
